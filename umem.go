@@ -1,10 +1,9 @@
 package xdp
 
 import (
-	"fmt"
 	"math"
-	"os"
 	"reflect"
+	"sync"
 	"syscall"
 	"unsafe"
 
@@ -20,6 +19,7 @@ type Umem struct {
 	fd       int
 	refCount int
 
+	frameLock  sync.Mutex
 	freeFrame  uint32
 	framesAddr []uint64
 }
@@ -27,27 +27,23 @@ type Umem struct {
 type UmemConfig struct {
 	FillSize      uint32
 	CompSize      uint32
-	FrameSize     uint32
-	FrameNum      uint32
+	Size          uint32
 	FrameHeadroom uint32
 	Flags         uint32
 }
 
-func defaultUmemConfig() UmemConfig {
-	return UmemConfig{
-		FillSize:      DEFAULT_FILL_SIZE,
-		CompSize:      DEFAULT_COMP_SIZE,
-		FrameSize:     uint32(os.Getpagesize()),
-		FrameNum:      DEFAULT_FRAME_NUM,
-		FrameHeadroom: 0,
-		Flags:         0,
-	}
+var defaultUmemConfig = UmemConfig{
+	FillSize:      DEFAULT_FILL_SIZE,
+	CompSize:      DEFAULT_COMP_SIZE,
+	Size:          _DEFAULT_FRAME_SIZE * DEFAULT_FRAME_NUM, //16M
+	FrameHeadroom: 0,
+	Flags:         0,
 }
 
 func NewUmem(config *UmemConfig) (*Umem, error) {
 	umem := new(Umem)
 	if config == nil {
-		*config = defaultUmemConfig()
+		config = &defaultUmemConfig
 	}
 	umem.config = *config
 	var err error
@@ -55,20 +51,16 @@ func NewUmem(config *UmemConfig) (*Umem, error) {
 	if err != nil {
 		return nil, err
 	}
-	umem.data, err = syscall.Mmap(-1, 0, int(umem.config.FrameSize*umem.config.FrameNum),
-		syscall.PROT_READ|syscall.PROT_WRITE,
-		syscall.MAP_PRIVATE|syscall.MAP_ANONYMOUS|syscall.MAP_POPULATE)
-	if err != nil {
-		return nil, errors.WithMessage(err, "Mmap")
-	}
-	umem.framesAddr = make([]uint64, umem.config.FrameNum)
-	for i := uint32(0); i < umem.config.FrameNum; i++ {
-		umem.putFrame(uint64(i) * uint64(umem.config.FrameSize))
+	umem.data = Posix_memalign(int(umem.config.Size))
+	framenum := umem.config.Size / _DEFAULT_FRAME_SIZE
+	umem.framesAddr = make([]uint64, framenum)
+	for i := uint32(0); i < framenum; i++ {
+		umem.putFrame(uint64(i) * uint64(_DEFAULT_FRAME_SIZE))
 	}
 	mr := unix.XDPUmemReg{
 		Addr:     uint64(uintptr(unsafe.Pointer(&umem.data[0]))),
 		Len:      uint64(len(umem.data)),
-		Size:     umem.config.FrameSize,
+		Size:     _DEFAULT_FRAME_SIZE,
 		Headroom: 0,
 		Flags:    0,
 	}
@@ -129,22 +121,33 @@ func NewUmem(config *UmemConfig) (*Umem, error) {
 	(*reflect.SliceHeader)(unsafe.Pointer(&umem.comp.Ring)).Data = uintptr(unsafe.Pointer(uintptr(unsafe.Pointer(&compBuffer[0])) + uintptr(off.Cr.Desc)))
 	(*reflect.SliceHeader)(unsafe.Pointer(&umem.comp.Ring)).Len = int(umem.config.CompSize)
 	(*reflect.SliceHeader)(unsafe.Pointer(&umem.comp.Ring)).Cap = int(umem.config.CompSize)
-
+	// go func() {
+	// 	// runtime.LockOSThread()
+	// 	for {
+	// 		umem.fill_fr()
+	// 		umem.cons_cr()
+	// 	}
+	// }()
 	return umem, nil
 }
 
-func (u *Umem) getFrame() uint64 {
+func (u *Umem) getFrame() (uint64, bool) {
+	u.frameLock.Lock()
+	defer u.frameLock.Unlock()
 	if u.freeFrame == 0 {
-		fmt.Println("Umem:No free frame")
-		return math.MaxUint64
+		// fmt.Println("Umem:No free frame")
+		return math.MaxUint64, false
 	}
+
 	u.freeFrame--
 	addr := u.framesAddr[u.freeFrame]
 	u.framesAddr[u.freeFrame] = math.MaxUint64
-	return addr
+	return addr, true
 }
 
 func (u *Umem) putFrame(addr uint64) {
+	u.frameLock.Lock()
+	defer u.frameLock.Unlock()
 	u.framesAddr[u.freeFrame] = addr
 	u.freeFrame++
 }
@@ -153,13 +156,30 @@ func (u *Umem) putFrame(addr uint64) {
 func (u *Umem) fill_fr() {
 	n := u.fill.prod_nb_free(u.freeFrame)
 	if n > 0 {
+		var prod uint32
 		for i := uint32(0); i < n; i++ {
-			u.fill.fill_addr(u.getFrame())
+			addr, ok := u.getFrame()
+			if !ok {
+				break
+			}
+			u.fill.fill_slot(addr)
+			prod++
 		}
-		u.fill.submit_prod(n)
+		u.fill.submit_prod(prod)
 	}
 }
 
 func (u *Umem) DescData(d unix.XDPDesc) []byte {
 	return u.data[d.Addr : d.Addr+uint64(d.Len)]
+}
+
+// 消费comp ring
+func (u *Umem) cons_cr() {
+	addrs := u.comp.slots(u.config.CompSize)
+	if n := uint32(len(addrs)); n > 0 {
+		for _, addr := range addrs {
+			u.putFrame(addr)
+		}
+		u.comp.submit_cons(n)
+	}
 }

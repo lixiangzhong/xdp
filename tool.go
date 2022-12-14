@@ -1,6 +1,21 @@
 package xdp
 
+/*
+#include <stdlib.h>
+#include <unistd.h>
+
+void *aligned_mem_alloc(size_t size){
+	void *packet_buffer;
+ 	int ret = posix_memalign(&packet_buffer, getpagesize(), size);
+	if (ret){
+		exit(ret);
+	}
+	return packet_buffer;
+}
+*/
+import "C"
 import (
+	"reflect"
 	"syscall"
 	"unsafe"
 
@@ -26,7 +41,7 @@ func ioctl(fd int, req uint, arg uintptr) syscall.Errno {
 	return 0
 }
 
-func get_nic_queues(ifname string) (cur int, max int, err error) {
+func GetNicQueues(ifname string) (cur int, max int, err error) {
 	var ifr ifreq
 	errno := ifr.SetIfrn(ifname)
 	if errno != 0 {
@@ -47,4 +62,48 @@ func get_nic_queues(ifname string) (cur int, max int, err error) {
 		return 1, 1, nil
 	}
 	return int(ch.combinedcount), int(ch.maxcombined), nil
+}
+
+func sendto(fd int) {
+	syscall.Syscall6(syscall.SYS_SENDTO, uintptr(fd), uintptr(0), uintptr(0), uintptr(syscall.MSG_DONTWAIT), uintptr(0), uintptr(0))
+}
+
+func Posix_memalign(size int) []byte {
+	ptr := C.aligned_mem_alloc(C.size_t(size))
+	var b []byte
+	(*reflect.SliceHeader)(unsafe.Pointer(&b)).Data = uintptr(ptr)
+	(*reflect.SliceHeader)(unsafe.Pointer(&b)).Len = size
+	(*reflect.SliceHeader)(unsafe.Pointer(&b)).Cap = size
+	return b
+}
+
+func SetNicPromisc(ifname string, promisc bool) error {
+	ifreq, err := unix.NewIfreq(ifname)
+	if err != nil {
+		return err
+	}
+	fd, err := syscall.Socket(unix.AF_INET, unix.SOCK_DGRAM, 0)
+	if err != nil {
+		return err
+	}
+	err = unix.IoctlIfreq(fd, unix.SIOCGIFFLAGS, ifreq)
+	if err != nil {
+		return err
+	}
+	flags := ifreq.Uint16()
+	// on := flags&unix.IFF_PROMISC > 0
+	// if on == promisc {
+	// 	return nil
+	// }
+	if promisc {
+		flags |= unix.IFF_PROMISC
+	} else {
+		flags &= ^uint16(unix.IFF_PROMISC)
+	}
+	ifreq.SetUint16(flags)
+	err = unix.IoctlIfreq(fd, unix.SIOCSIFFLAGS, ifreq)
+	if err != nil {
+		return err
+	}
+	return nil
 }

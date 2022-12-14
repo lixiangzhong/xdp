@@ -1,6 +1,7 @@
 package xdp
 
 import (
+	"log"
 	"reflect"
 	"syscall"
 	"unsafe"
@@ -20,25 +21,22 @@ type Socket struct {
 type SocketConfig struct {
 	RxSize    uint32
 	TxSize    uint32
-	XDPFlags  uint32 //unix.XDP_FLAGS_*
-	BindFlags uint16 //unix.XDP_COPY unix.XDP_ZEROCOPY unix.XDP_SHARED_UMEM
+	BindFlags uint16 //unix.XDP_COPY unix.XDP_ZEROCOPY unix.XDP_SHARED_UMEM unix.XDP_USE_NEED_WAKEUP
 	QueueID   int
+	Poll      bool
 }
 
-func defaultSocketConfig() SocketConfig {
-	return SocketConfig{
-		RxSize:    DEFAULT_RX_SIZE,
-		TxSize:    DEFAULT_TX_SIZE,
-		XDPFlags:  0,
-		BindFlags: 0,
-		QueueID:   0,
-	}
+var defaultSocketConfig = SocketConfig{
+	RxSize:    DEFAULT_RX_SIZE,
+	TxSize:    DEFAULT_TX_SIZE,
+	BindFlags: 0,
+	QueueID:   0,
 }
 
 func NewSocket(ifindex int, umem *Umem, cfg *SocketConfig) (*Socket, error) {
 	var err error
 	if cfg == nil {
-		*cfg = defaultSocketConfig()
+		cfg = &defaultSocketConfig
 	}
 	if umem == nil {
 		umem, err = NewUmem(nil)
@@ -48,7 +46,7 @@ func NewSocket(ifindex int, umem *Umem, cfg *SocketConfig) (*Socket, error) {
 	}
 	var socket Socket
 	if umem.refCount > 0 {
-		fd, err := syscall.Socket(unix.AF_XDP, unix.SOCK_RAW, 0)
+		fd, err := syscall.Socket(unix.AF_XDP, unix.SOCK_RAW|unix.SOCK_CLOEXEC, 0)
 		if err != nil {
 			return nil, errors.WithMessage(err, "AF_XDP")
 		}
@@ -119,15 +117,88 @@ func NewSocket(ifindex int, umem *Umem, cfg *SocketConfig) (*Socket, error) {
 		Ifindex: uint32(ifindex),
 	}
 	if umem.refCount > 0 {
-		sxdp.Flags = unix.XDP_SHARED_UMEM
-		sxdp.SharedUmemFD = uint32(socket.fd)
+		sxdp.Flags |= unix.XDP_SHARED_UMEM
+		sxdp.SharedUmemFD = uint32(umem.fd)
 	} else {
 		sxdp.Flags = socket.config.BindFlags
 	}
+	if socket.config.Poll {
+		sxdp.Flags |= unix.XDP_USE_NEED_WAKEUP
+	}
 	err = unix.Bind(socket.fd, &sxdp)
 	if err != nil {
+		log.Println(int(err.(syscall.Errno)))
 		return nil, errors.WithMessage(err, "Bind")
 	}
 	umem.refCount++
 	return &socket, nil
+}
+
+// HandleRecv  handler 返回false时表示已将此frame直接放入Tx队列,不回收frame
+func (s *Socket) HandleRecv(handler func(unix.XDPDesc, []byte) bool) {
+	fds := make([]unix.PollFd, 1)
+	fds[0].Fd = int32(s.fd)
+	fds[0].Events = unix.POLLIN
+	for {
+		if s.config.Poll {
+			unix.Poll(fds, -1)
+		}
+		descs := s.rx.slots(s.rx.Size)
+		s.umem.fill_fr()
+		for i := range descs {
+			data := s.umem.DescData(descs[i])
+			if handler(descs[i], data) {
+				s.umem.putFrame(descs[i].Addr)
+			}
+		}
+		s.rx.submit_cons(uint32(len(descs)))
+	}
+}
+
+func (s *Socket) write(b []byte) bool {
+	addr, ok := s.umem.getFrame()
+	if !ok {
+		return false
+	}
+	desc := unix.XDPDesc{Addr: addr, Len: _DEFAULT_FRAME_SIZE}
+	frame := s.umem.DescData(desc)
+	n := copy(frame, b)
+	desc.Len = uint32(n)
+	s.tx.fill_slot(desc)
+	return true
+}
+
+func (s *Socket) Write(bs ...[]byte) uint32 {
+	s.umem.cons_cr()
+	var n uint32
+	for _, b := range bs {
+		if s.write(b) {
+			n++
+		}
+	}
+	if n > 0 {
+		s.tx.submit_prod(n)
+		sendto(s.fd)
+	}
+	return n
+}
+
+func (s *Socket) FD() int {
+	return s.fd
+}
+
+// WriteDesc 包已写入umem ,直接把desc加入tx队列发送
+func (s *Socket) WriteDesc(d unix.XDPDesc) {
+	s.tx.fill_slot(d)
+	s.tx.submit_prod(1)
+	sendto(s.fd)
+}
+
+func (s *Socket) Stats() (unix.XDPStatistics, error) {
+	var stats unix.XDPStatistics
+	_, _, errno := syscall.Syscall6(unix.SYS_GETSOCKOPT, uintptr(s.fd), unix.SOL_XDP, unix.XDP_STATISTICS, uintptr(unsafe.Pointer(&stats)), 48, 0)
+	if errno != 0 {
+		return stats, errno
+	}
+	return stats, nil
 }
